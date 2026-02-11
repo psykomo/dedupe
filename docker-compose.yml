@@ -1,0 +1,55 @@
+services:
+  source-db:
+    image: mariadb:11.4
+    container_name: dedupe-source-db
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: rootpass
+      MARIADB_DATABASE: corrections_prod
+      MARIADB_USER: readonly_source_user
+      MARIADB_PASSWORD: source_pass
+    ports:
+      - "3307:3306"
+    volumes:
+      - source_db_data:/var/lib/mysql
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mariadb-admin ping -h localhost -uroot -p$${MARIADB_ROOT_PASSWORD} --silent",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  source-seed:
+    image: mariadb:11.4
+    depends_on:
+      source-db:
+        condition: service_healthy
+    environment:
+      MYSQL_HOST: source-db
+      MYSQL_PORT: 3306
+      MYSQL_DATABASE: corrections_prod
+      MYSQL_USER: root
+      MYSQL_PASSWORD: rootpass
+      SEED_ROWS: 500000
+      FORCE_RESEED: "false"
+    volumes:
+      - ./docker/source/seed:/seed:ro
+    entrypoint: ["/bin/sh", "/seed/seed.sh"]
+    restart: "no"
+
+  adminer:
+    image: adminer:4.8.1
+    container_name: dedupe-adminer
+    restart: unless-stopped
+    depends_on:
+      source-db:
+        condition: service_healthy
+    ports:
+      - "8081:8080"
+
+volumes:
+  source_db_data:

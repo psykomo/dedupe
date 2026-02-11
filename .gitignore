@@ -1,0 +1,44 @@
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Python / packaging
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Virtual envs / uv
+.venv/
+venv/
+.python-version
+
+# Local config / secrets
+.env
+.env.*
+config.yaml
+config.local*.yaml
+
+# Local pipeline outputs / runtime data
+work/
+*.duckdb
+*.duckdb.wal
+*.db
+*.sqlite
+*.parquet
+
+# Tooling logs
+*.log
