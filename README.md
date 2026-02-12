@@ -60,7 +60,7 @@ Run full dedupe:
 uv run inmate-dedupe --config config.yaml full
 ```
 
-Run incremental dedupe (requires `source_mysql.source_updated_at_column`):
+Run incremental dedupe:
 
 ```bash
 uv run inmate-dedupe --config config.yaml incremental
@@ -85,7 +85,8 @@ Use `source_mysql.custom_query` when you only have read access and need joins/fi
 Rules:
 - Keep `source_mysql.source_table` as a stable logical name (used for run/state metadata).
 - `custom_query` must output all columns mapped in `columns.*`.
-- `custom_query` must output `source_id_column` and `source_updated_at_column`.
+- `custom_query` must output `source_id_column`.
+- `custom_query` should output `source_updated_at_column` if you want updated-at cursor mode.
 - Do not include `LIMIT` in `custom_query`; pipeline controls batching and pagination.
 
 Example:
@@ -114,6 +115,23 @@ source_mysql:
   source_id_column: "NOMOR_INDUK"
   source_updated_at_column: "UPDATED_AT"
 ```
+
+## Cursor Modes
+
+- `updated_at` cursor mode (default when `source_updated_at_column` is set):
+  - incremental filter: `source_updated_at > watermark`
+  - bootstrap filter: up to a fixed cutoff timestamp
+- `source_id` cursor mode (automatic when `source_updated_at_column: null`):
+  - incremental/bootstrap filter: `source_id_column > last_cursor`
+  - ordering: `ORDER BY source_id_column ASC`
+  - designed for lexically sortable IDs such as `NOMOR_INDUK`
+
+`validate-source` now reports the active `cursor_mode` and sample parseability of `NOMOR_INDUK` into:
+- `id_upt` (1-3)
+- `year` (4-7)
+- `month` (8-9)
+- `day` (10-11)
+- `sequence` (12-15)
 
 Bootstrap mode behavior:
 - First bootstrap run pins a cutoff timestamp and stores cursor state in DuckDB (`pipeline_bootstrap_state`).

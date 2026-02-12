@@ -81,8 +81,10 @@ CREATE TABLE IF NOT EXISTS pipeline_bootstrap_state (
 CREATE TABLE IF NOT EXISTS pipeline_watermark (
   source_table VARCHAR PRIMARY KEY,
   source_updated_at TIMESTAMP NULL,
+  source_record_id VARCHAR NULL,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+ALTER TABLE pipeline_watermark ADD COLUMN IF NOT EXISTS source_record_id VARCHAR;
 
 CREATE INDEX IF NOT EXISTS idx_record_entity_map_entity_id ON record_entity_map(entity_id);
 CREATE INDEX IF NOT EXISTS idx_review_queue_status ON review_queue(status);

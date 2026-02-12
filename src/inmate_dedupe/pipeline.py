@@ -85,6 +85,9 @@ class DedupePipeline:
             sample_rows=sample_rows,
         )
 
+    def _use_source_id_cursor_mode(self) -> bool:
+        return not bool(self.cfg.source_mysql.source_updated_at_column)
+
     def run_full(self) -> RunSummary:
         run_id = self.dedupe_store.create_run(
             run_type="full",
@@ -185,7 +188,9 @@ class DedupePipeline:
                 review_candidates=len(review_rows),
                 new_entities=len(entity_rows),
             )
-            if max_seen is not None:
+            if self._use_source_id_cursor_mode():
+                self._save_record_id_watermark(str(frame["record_id"].max()))
+            elif max_seen is not None:
                 self._save_watermark(max_seen)
 
             self._persist_run_artifact(run_id, "full_clusters.parquet", clusters)
@@ -212,9 +217,11 @@ class DedupePipeline:
             raise
 
     def run_incremental(self) -> RunSummary:
-        if not self.cfg.source_mysql.source_updated_at_column:
-            raise ValueError("Incremental mode requires source_mysql.source_updated_at_column")
+        if self._use_source_id_cursor_mode():
+            return self._run_incremental_source_id()
+        return self._run_incremental_updated_at()
 
+    def _run_incremental_updated_at(self) -> RunSummary:
         since_ts = self._effective_incremental_since()
         run_id = self.dedupe_store.create_run(
             run_type="incremental",
@@ -282,9 +289,84 @@ class DedupePipeline:
             )
             raise
 
+    def _run_incremental_source_id(self) -> RunSummary:
+        since_record_id = self._effective_incremental_since_record_id()
+        run_id = self.dedupe_store.create_run(
+            run_type="incremental",
+            model_version=self.cfg.run.model_version,
+            threshold_auto=self.cfg.thresholds.auto_match_probability,
+            threshold_review=self.cfg.thresholds.review_match_probability,
+            source_table=self.cfg.source_mysql.source_table,
+            source_since_ts=None,
+            metadata={
+                "blocking_rules": self.cfg.blocking_rules.incremental,
+                "cursor_mode": "source_id",
+                "source_since_record_id": since_record_id,
+            },
+        )
+        try:
+            frame, last_record_id = self._extract_normalized_source_by_record_id(since_record_id=since_record_id)
+            if frame.empty:
+                self.dedupe_store.complete_run(
+                    run_id=run_id,
+                    status="completed",
+                    records_processed=0,
+                    auto_matches=0,
+                    review_candidates=0,
+                    new_entities=0,
+                )
+                return RunSummary(run_id, "incremental", 0, 0, 0, 0, 0)
+
+            outcome = self._link_records_to_entities(frame, run_id, run_type="incremental")
+            if outcome.entity_rows:
+                self.dedupe_store.upsert_unique_inmates(outcome.entity_rows)
+            if outcome.map_rows:
+                self.dedupe_store.upsert_record_entity_map(outcome.map_rows)
+            if outcome.review_rows:
+                self.dedupe_store.insert_review_candidates(outcome.review_rows)
+
+            self.dedupe_store.complete_run(
+                run_id=run_id,
+                status="completed",
+                records_processed=len(frame),
+                auto_matches=outcome.auto_matches,
+                review_candidates=outcome.review_candidates,
+                new_entities=outcome.new_entities,
+            )
+            if last_record_id:
+                self._save_record_id_watermark(last_record_id)
+
+            self._persist_run_artifact(run_id, "incremental_auto_links.parquet", outcome.auto_links)
+            self._persist_run_artifact(run_id, "incremental_review_links.parquet", outcome.review_links)
+            self._persist_run_artifact(run_id, "incremental_unmatched.parquet", outcome.unmatched)
+
+            return RunSummary(
+                run_id=run_id,
+                run_type="incremental",
+                records_processed=len(frame),
+                auto_matches=outcome.auto_matches,
+                review_candidates=outcome.review_candidates,
+                new_entities=outcome.new_entities,
+                scored_pairs=outcome.scored_pairs,
+            )
+        except Exception as exc:
+            self.dedupe_store.complete_run(
+                run_id=run_id,
+                status="failed",
+                records_processed=0,
+                auto_matches=0,
+                review_candidates=0,
+                new_entities=0,
+                error_message=str(exc)[:65535],
+            )
+            raise
+
     def run_bootstrap(self, max_rows: int | None = None) -> RunSummary:
-        if not self.cfg.source_mysql.source_updated_at_column:
-            raise ValueError("Bootstrap mode requires source_mysql.source_updated_at_column")
+        if self._use_source_id_cursor_mode():
+            return self._run_bootstrap_source_id(max_rows=max_rows)
+        return self._run_bootstrap_updated_at(max_rows=max_rows)
+
+    def _run_bootstrap_updated_at(self, max_rows: int | None = None) -> RunSummary:
 
         batch_rows = max_rows or self.cfg.run.bootstrap_batch_rows
         if batch_rows <= 0:
@@ -422,6 +504,167 @@ class DedupePipeline:
             self._save_bootstrap_state(new_state)
             if completed:
                 self._mirror_watermark_file(state.cutoff_ts)
+
+            return RunSummary(
+                run_id=run_id,
+                run_type="bootstrap",
+                records_processed=len(frame),
+                auto_matches=outcome.auto_matches,
+                review_candidates=outcome.review_candidates,
+                new_entities=outcome.new_entities,
+                scored_pairs=outcome.scored_pairs,
+            )
+        except Exception as exc:
+            if not committed:
+                self.dedupe_store.complete_run(
+                    run_id=run_id,
+                    status="failed",
+                    records_processed=0,
+                    auto_matches=0,
+                    review_candidates=0,
+                    new_entities=0,
+                    error_message=str(exc)[:65535],
+                )
+            raise
+
+    def _run_bootstrap_source_id(self, max_rows: int | None = None) -> RunSummary:
+        batch_rows = max_rows or self.cfg.run.bootstrap_batch_rows
+        if batch_rows <= 0:
+            raise ValueError("bootstrap max_rows must be > 0")
+
+        state = self._load_bootstrap_state()
+        if state is None:
+            state = BootstrapState(
+                cutoff_ts=datetime.utcnow().replace(microsecond=0),
+                cursor_updated_at=None,
+                cursor_record_id=None,
+                completed=False,
+                rows_processed_total=0,
+            )
+
+        run_id = self.dedupe_store.create_run(
+            run_type="bootstrap",
+            model_version=self.cfg.run.model_version,
+            threshold_auto=self.cfg.thresholds.auto_match_probability,
+            threshold_review=self.cfg.thresholds.review_match_probability,
+            source_table=self.cfg.source_mysql.source_table,
+            source_since_ts=None,
+            metadata={
+                "mode": "bootstrap",
+                "cursor_mode": "source_id",
+                "cursor_record_id": state.cursor_record_id,
+                "batch_rows": batch_rows,
+                "already_completed": state.completed,
+            },
+        )
+        committed = False
+        try:
+            frame, last_record_id = self._extract_normalized_source_slice_by_record_id(
+                cursor_record_id=state.cursor_record_id,
+                max_rows=batch_rows,
+            )
+
+            raw_rows = int(frame.attrs.get("raw_rows", 0))
+            if raw_rows == 0:
+                completed_state = BootstrapState(
+                    cutoff_ts=state.cutoff_ts,
+                    cursor_updated_at=None,
+                    cursor_record_id=state.cursor_record_id,
+                    completed=True,
+                    rows_processed_total=state.rows_processed_total,
+                )
+                self.dedupe_store.commit_bootstrap_batch(
+                    run_id=run_id,
+                    source_table=self.cfg.source_mysql.source_table,
+                    entity_rows=[],
+                    map_rows=[],
+                    review_rows=[],
+                    records_processed=0,
+                    auto_matches=0,
+                    review_candidates=0,
+                    new_entities=0,
+                    cutoff_ts=completed_state.cutoff_ts,
+                    cursor_updated_at=None,
+                    cursor_record_id=completed_state.cursor_record_id,
+                    completed=completed_state.completed,
+                    rows_processed_total=completed_state.rows_processed_total,
+                    watermark_candidate=None,
+                    watermark_record_id_candidate=completed_state.cursor_record_id,
+                )
+                committed = True
+                self._save_bootstrap_state(completed_state)
+                if completed_state.cursor_record_id:
+                    self._save_record_id_watermark(completed_state.cursor_record_id)
+                return RunSummary(run_id, "bootstrap", 0, 0, 0, 0, 0)
+
+            if frame.empty:
+                completed = raw_rows < batch_rows
+                new_state = BootstrapState(
+                    cutoff_ts=state.cutoff_ts,
+                    cursor_updated_at=None,
+                    cursor_record_id=last_record_id or state.cursor_record_id,
+                    completed=completed,
+                    rows_processed_total=state.rows_processed_total,
+                )
+                self.dedupe_store.commit_bootstrap_batch(
+                    run_id=run_id,
+                    source_table=self.cfg.source_mysql.source_table,
+                    entity_rows=[],
+                    map_rows=[],
+                    review_rows=[],
+                    records_processed=0,
+                    auto_matches=0,
+                    review_candidates=0,
+                    new_entities=0,
+                    cutoff_ts=new_state.cutoff_ts,
+                    cursor_updated_at=None,
+                    cursor_record_id=new_state.cursor_record_id,
+                    completed=new_state.completed,
+                    rows_processed_total=new_state.rows_processed_total,
+                    watermark_candidate=None,
+                    watermark_record_id_candidate=new_state.cursor_record_id if completed else None,
+                )
+                committed = True
+                self._save_bootstrap_state(new_state)
+                if completed and new_state.cursor_record_id:
+                    self._save_record_id_watermark(new_state.cursor_record_id)
+                return RunSummary(run_id, "bootstrap", 0, 0, 0, 0, 0)
+
+            outcome = self._link_records_to_entities(frame, run_id, run_type="bootstrap")
+
+            completed = len(frame) < batch_rows
+            new_state = BootstrapState(
+                cutoff_ts=state.cutoff_ts,
+                cursor_updated_at=None,
+                cursor_record_id=last_record_id or state.cursor_record_id,
+                completed=completed,
+                rows_processed_total=state.rows_processed_total + len(frame),
+            )
+            self._persist_run_artifact(run_id, "bootstrap_auto_links.parquet", outcome.auto_links)
+            self._persist_run_artifact(run_id, "bootstrap_review_links.parquet", outcome.review_links)
+            self._persist_run_artifact(run_id, "bootstrap_unmatched.parquet", outcome.unmatched)
+            self.dedupe_store.commit_bootstrap_batch(
+                run_id=run_id,
+                source_table=self.cfg.source_mysql.source_table,
+                entity_rows=outcome.entity_rows,
+                map_rows=outcome.map_rows,
+                review_rows=outcome.review_rows,
+                records_processed=len(frame),
+                auto_matches=outcome.auto_matches,
+                review_candidates=outcome.review_candidates,
+                new_entities=outcome.new_entities,
+                cutoff_ts=new_state.cutoff_ts,
+                cursor_updated_at=None,
+                cursor_record_id=new_state.cursor_record_id,
+                completed=new_state.completed,
+                rows_processed_total=new_state.rows_processed_total,
+                watermark_candidate=None,
+                watermark_record_id_candidate=new_state.cursor_record_id if completed else None,
+            )
+            committed = True
+            self._save_bootstrap_state(new_state)
+            if completed and new_state.cursor_record_id:
+                self._save_record_id_watermark(new_state.cursor_record_id)
 
             return RunSummary(
                 run_id=run_id,
@@ -687,6 +930,32 @@ class DedupePipeline:
         frame = frame.drop_duplicates(subset=["record_id"], keep="last")
         return frame, max_seen
 
+    def _extract_normalized_source_by_record_id(self, since_record_id: str | None) -> tuple[pd.DataFrame, str | None]:
+        projection = self._projection_columns()
+        chunks: list[pd.DataFrame] = []
+        last_record_id: str | None = since_record_id
+        id_col = self.cfg.source_mysql.source_id_column
+
+        for raw in self.source_store.stream_source_rows(
+            projection_columns=projection,
+            batch_size=self.cfg.run.batch_size,
+            since_record_id=since_record_id,
+        ):
+            cleaned = normalize_source_frame(raw, self.cfg)
+            if cleaned.empty:
+                continue
+            chunks.append(cleaned)
+            if id_col in raw.columns and len(raw) > 0:
+                last_record_id = str(raw.iloc[-1][id_col])
+
+        if not chunks:
+            return pd.DataFrame(), last_record_id
+        frame = pd.concat(chunks, axis=0, ignore_index=True)
+        frame = frame.drop_duplicates(subset=["record_id"], keep="last")
+        if not frame.empty:
+            last_record_id = str(frame["record_id"].max())
+        return frame, last_record_id
+
     def _extract_normalized_source_slice(
         self,
         cutoff_ts: datetime,
@@ -716,6 +985,30 @@ class DedupePipeline:
         last_updated = _as_datetime(raw.iloc[-1][updated_col]) if updated_col else None
         last_record_id = str(raw.iloc[-1][id_col]) if id_col in raw.columns else None
         return cleaned, last_updated, last_record_id
+
+    def _extract_normalized_source_slice_by_record_id(
+        self,
+        cursor_record_id: str | None,
+        max_rows: int,
+    ) -> tuple[pd.DataFrame, str | None]:
+        projection = self._projection_columns()
+        raw = self.source_store.fetch_source_slice_by_id(
+            projection_columns=projection,
+            max_rows=max_rows,
+            cursor_record_id=cursor_record_id,
+        )
+        if raw.empty:
+            empty = pd.DataFrame()
+            empty.attrs["raw_rows"] = 0
+            return empty, None
+
+        cleaned = normalize_source_frame(raw, self.cfg)
+        cleaned = cleaned.drop_duplicates(subset=["record_id"], keep="last")
+        cleaned.attrs["raw_rows"] = len(raw)
+
+        id_col = self.cfg.source_mysql.source_id_column
+        last_record_id = str(raw.iloc[-1][id_col]) if id_col in raw.columns else None
+        return cleaned, last_record_id
 
     def _projection_columns(self) -> list[str]:
         c = self.cfg.columns
@@ -755,7 +1048,7 @@ class DedupePipeline:
         path = self.cfg.run.watermark_file
         if not path.exists():
             return None
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = self._load_watermark_payload_file()
         value = payload.get("source_updated_at")
         if not value:
             return None
@@ -772,13 +1065,52 @@ class DedupePipeline:
         self._mirror_watermark_file(source_updated_at)
 
     def _mirror_watermark_file(self, source_updated_at: datetime) -> None:
-        payload = {"source_updated_at": source_updated_at.isoformat()}
+        payload = self._load_watermark_payload_file()
+        payload["source_updated_at"] = source_updated_at.isoformat()
         self.cfg.run.watermark_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def _set_watermark_if_newer(self, candidate: datetime) -> None:
         current = self._load_watermark()
         if current is None or candidate > current:
             self._save_watermark(candidate)
+
+    def _load_record_id_watermark(self) -> str | None:
+        db_value = self.dedupe_store.load_record_id_watermark(self.cfg.source_mysql.source_table)
+        if db_value:
+            return db_value
+        payload = self._load_watermark_payload_file()
+        value = payload.get("source_record_id")
+        if value is None:
+            return None
+        token = str(value).strip()
+        return token or None
+
+    def _save_record_id_watermark(self, source_record_id: str) -> None:
+        token = str(source_record_id).strip()
+        if not token:
+            return
+        self.dedupe_store.save_record_id_watermark(
+            source_table=self.cfg.source_mysql.source_table,
+            source_record_id=token,
+        )
+        self._mirror_record_id_watermark_file(token)
+
+    def _mirror_record_id_watermark_file(self, source_record_id: str) -> None:
+        payload = self._load_watermark_payload_file()
+        payload["source_record_id"] = source_record_id
+        self.cfg.run.watermark_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def _load_watermark_payload_file(self) -> dict[str, Any]:
+        path = self.cfg.run.watermark_file
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {}
+        if isinstance(payload, dict):
+            return payload
+        return {}
 
     def _load_bootstrap_state(self) -> BootstrapState | None:
         db_state = self.dedupe_store.load_bootstrap_state(self.cfg.source_mysql.source_table)
@@ -824,6 +1156,14 @@ class DedupePipeline:
             if since_ts is None or bootstrap_state.cutoff_ts > since_ts:
                 return bootstrap_state.cutoff_ts
         return since_ts
+
+    def _effective_incremental_since_record_id(self) -> str | None:
+        since_id = self._load_record_id_watermark()
+        bootstrap_state = self._load_bootstrap_state()
+        if bootstrap_state and not bootstrap_state.completed and bootstrap_state.cursor_record_id:
+            if since_id is None or bootstrap_state.cursor_record_id > since_id:
+                return bootstrap_state.cursor_record_id
+        return since_id
 
     def _persist_run_artifact(self, run_id: int, filename: str, frame: pd.DataFrame) -> None:
         run_dir = self.cfg.run.work_dir / f"run_{run_id}"

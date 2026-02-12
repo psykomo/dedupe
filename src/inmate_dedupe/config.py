@@ -176,7 +176,7 @@ def load_config(path: str | Path) -> AppConfig:
     if not cfg.blocking_rules.full or not cfg.blocking_rules.incremental:
         raise ValueError("At least one blocking rule is required for full and incremental runs")
     if not cfg.source_mysql.source_updated_at_column:
-        # Full run works without this; incremental requires it and will fail fast.
+        # Incremental/bootstrap will use source_id cursor mode.
         pass
 
     cfg.run.work_dir.mkdir(parents=True, exist_ok=True)

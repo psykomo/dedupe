@@ -9,15 +9,11 @@ services:
       MARIADB_USER: readonly_source_user
       MARIADB_PASSWORD: source_pass
     ports:
-      - "3307:3306"
+      - "3309:3306"
     volumes:
       - source_db_data:/var/lib/mysql
     healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "mariadb-admin ping -h localhost -uroot -p$${MARIADB_ROOT_PASSWORD} --silent",
-        ]
+      test: [ "CMD-SHELL", "mariadb-admin ping -h localhost -uroot -p$${MARIADB_ROOT_PASSWORD} --silent" ]
       interval: 10s
       timeout: 5s
       retries: 30
@@ -38,7 +34,7 @@ services:
       FORCE_RESEED: "false"
     volumes:
       - ./docker/source/seed:/seed:ro
-    entrypoint: ["/bin/sh", "/seed/seed.sh"]
+    entrypoint: [ "/bin/sh", "/seed/seed.sh" ]
     restart: "no"
 
   adminer:

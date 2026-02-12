@@ -15,6 +15,7 @@ from inmate_dedupe.config import DedupeDuckDBConfig, SourceMysqlConfig
 
 
 SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+NOMOR_INDUK_PATTERN = re.compile(r"^\d{15}$")
 
 
 def _assert_identifier(value: str) -> str:
@@ -113,15 +114,27 @@ class SourceMySQLReader:
                 normalized_id = sample["__record_id"].map(lambda v: None if v is None else str(v).strip())
                 null_or_blank_id = int((normalized_id.isna() | (normalized_id == "")).sum())
                 duplicate_id = int(normalized_id.dropna().duplicated().sum())
+                parsed_nomor = [p for p in normalized_id.dropna().map(_parse_nomor_induk_parts).tolist() if p is not None]
+                sample_nomor_parseable = int(len(parsed_nomor))
+                sample_nomor_unparseable = int(len(normalized_id.dropna()) - sample_nomor_parseable)
+                sample_nomor_examples = parsed_nomor[:5]
             else:
                 null_or_blank_id = sample_rows
                 duplicate_id = 0
+                sample_nomor_parseable = 0
+                sample_nomor_unparseable = 0
+                sample_nomor_examples = []
                 issues.append(f"Missing required id column in result: {self.cfg.source_id_column}")
+
+            if null_or_blank_id > 0:
+                issues.append(
+                    f"Found {null_or_blank_id} null/blank source_id values in sample for column {self.cfg.source_id_column}."
+                )
 
             null_updated = 0
             invalid_updated = 0
             if updated_col is None:
-                issues.append("source_updated_at_column is null; incremental/bootstrap are not available.")
+                pass
             elif "__source_updated_at" not in sample.columns:
                 issues.append(f"Missing updated-at column in result: {self.cfg.source_updated_at_column}")
             else:
@@ -130,16 +143,24 @@ class SourceMySQLReader:
                 parsed_updated = pd.to_datetime(updated_series, errors="coerce")
                 invalid_updated = int((~updated_series.isna() & parsed_updated.isna()).sum())
 
-            incremental_ready = bool(updated_col is not None and "__source_updated_at" in sample.columns)
-            if incremental_ready and invalid_updated > 0:
-                incremental_ready = False
-                issues.append(
-                    f"Found {invalid_updated} non-null source_updated_at values that are not parseable as datetime in sample."
-                )
+            if updated_col is not None:
+                incremental_ready = bool("__source_updated_at" in sample.columns and null_or_blank_id == 0)
+                if incremental_ready and invalid_updated > 0:
+                    incremental_ready = False
+                    issues.append(
+                        f"Found {invalid_updated} non-null source_updated_at values that are not parseable as datetime in sample."
+                    )
+                cursor_mode = "updated_at"
+            else:
+                incremental_ready = bool("__record_id" in sample.columns and null_or_blank_id == 0)
+                cursor_mode = "source_id"
+
+            bootstrap_ready = incremental_ready
 
             return {
                 "ok": len(issues) == 0,
                 "mode": "custom_query" if self._normalized_custom_query() else "table",
+                "cursor_mode": cursor_mode,
                 "source_table": self.cfg.source_table,
                 "source_id_column": self.cfg.source_id_column,
                 "source_updated_at_column": self.cfg.source_updated_at_column,
@@ -148,11 +169,14 @@ class SourceMySQLReader:
                 "sample_rows_observed": int(len(sample)),
                 "sample_null_or_blank_record_id": null_or_blank_id,
                 "sample_duplicate_record_id": duplicate_id,
+                "sample_nomor_induk_parseable": sample_nomor_parseable,
+                "sample_nomor_induk_unparseable": sample_nomor_unparseable,
+                "sample_nomor_induk_examples": sample_nomor_examples,
                 "sample_null_source_updated_at": null_updated,
                 "sample_invalid_source_updated_at": invalid_updated,
                 "full_ready": True,
                 "incremental_ready": incremental_ready,
-                "bootstrap_ready": incremental_ready,
+                "bootstrap_ready": bootstrap_ready,
                 "issues": issues,
             }
         finally:
@@ -164,7 +188,10 @@ class SourceMySQLReader:
         projection_columns: list[str],
         batch_size: int,
         since_ts: datetime | None = None,
+        since_record_id: str | None = None,
     ) -> Iterator[pd.DataFrame]:
+        if since_ts is not None and since_record_id is not None:
+            raise ValueError("Use either since_ts or since_record_id, not both")
         source_relation_sql, use_alias = self._source_relation_sql()
         id_col = _assert_identifier(self.cfg.source_id_column)
         updated_col = (
@@ -185,6 +212,9 @@ class SourceMySQLReader:
                 raise ValueError("Incremental mode requires source_updated_at_column in source_mysql config")
             sql += f" WHERE {self._column_ref(updated_col, use_alias)} > %s"
             params.append(since_ts)
+        elif since_record_id is not None:
+            sql += f" WHERE {self._column_ref(id_col, use_alias)} > %s"
+            params.append(str(since_record_id))
 
         if updated_col:
             sql += (
@@ -203,6 +233,54 @@ class SourceMySQLReader:
                 if not rows:
                     break
                 yield pd.DataFrame(rows)
+        finally:
+            cursor.close()
+            conn.close()
+
+    def fetch_source_slice_by_id(
+        self,
+        projection_columns: list[str],
+        max_rows: int,
+        cursor_record_id: str | None = None,
+        upper_bound_record_id: str | None = None,
+    ) -> pd.DataFrame:
+        if max_rows <= 0:
+            raise ValueError("max_rows must be > 0")
+
+        source_relation_sql, use_alias = self._source_relation_sql()
+        id_col = _assert_identifier(self.cfg.source_id_column)
+        for col in projection_columns:
+            _assert_identifier(col)
+
+        selected_cols = ", ".join(
+            [f"{self._column_ref(col, use_alias)} AS `{col}`" for col in projection_columns]
+        )
+        id_ref = self._column_ref(id_col, use_alias)
+        sql = f"""
+            SELECT {selected_cols}
+              FROM {source_relation_sql}
+             WHERE {id_ref} IS NOT NULL
+        """
+        params: list[Any] = []
+        if cursor_record_id:
+            sql += f" AND {id_ref} > %s"
+            params.append(str(cursor_record_id))
+        if upper_bound_record_id:
+            sql += f" AND {id_ref} <= %s"
+            params.append(str(upper_bound_record_id))
+
+        sql += f"""
+             ORDER BY {id_ref} ASC
+             LIMIT %s
+        """
+        params.append(max_rows)
+
+        conn = self._connect()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(sql, tuple(params))
+        try:
+            rows = cursor.fetchall()
+            return pd.DataFrame(rows)
         finally:
             cursor.close()
             conn.close()
@@ -294,10 +372,12 @@ class DedupeDuckDBStore:
             CREATE TABLE IF NOT EXISTS pipeline_watermark (
               source_table VARCHAR PRIMARY KEY,
               source_updated_at TIMESTAMP NULL,
+              source_record_id VARCHAR NULL,
               updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
+        conn.execute("ALTER TABLE pipeline_watermark ADD COLUMN IF NOT EXISTS source_record_id VARCHAR")
 
     def _complete_run_tx(
         self,
@@ -507,8 +587,8 @@ class DedupeDuckDBStore:
         if existing is None:
             conn.execute(
                 """
-                INSERT INTO pipeline_watermark (source_table, source_updated_at, updated_at)
-                VALUES (?, ?, CURRENT_TIMESTAMP)
+                INSERT INTO pipeline_watermark (source_table, source_updated_at, source_record_id, updated_at)
+                VALUES (?, ?, NULL, CURRENT_TIMESTAMP)
                 """,
                 [source_table, candidate],
             )
@@ -523,6 +603,44 @@ class DedupeDuckDBStore:
                  WHERE source_table = ?
                 """,
                 [candidate, source_table],
+            )
+
+    def _set_record_id_watermark_if_greater_tx(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        *,
+        source_table: str,
+        candidate: str,
+    ) -> None:
+        candidate_value = str(candidate).strip()
+        if not candidate_value:
+            return
+
+        self._ensure_state_tables(conn)
+        existing = conn.execute(
+            "SELECT source_record_id FROM pipeline_watermark WHERE source_table = ?",
+            [source_table],
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                """
+                INSERT INTO pipeline_watermark (source_table, source_updated_at, source_record_id, updated_at)
+                VALUES (?, NULL, ?, CURRENT_TIMESTAMP)
+                """,
+                [source_table, candidate_value],
+            )
+            return
+        current_raw = existing[0]
+        current = str(current_raw).strip() if current_raw is not None else ""
+        if not current or candidate_value > current:
+            conn.execute(
+                """
+                UPDATE pipeline_watermark
+                   SET source_record_id = ?,
+                       updated_at = CURRENT_TIMESTAMP
+                 WHERE source_table = ?
+                """,
+                [candidate_value, source_table],
             )
 
     def apply_schema(self, sql_path: str | Path) -> None:
@@ -715,6 +833,25 @@ class DedupeDuckDBStore:
         finally:
             conn.close()
 
+    def load_record_id_watermark(self, source_table: str) -> str | None:
+        conn = self._connect()
+        try:
+            self._ensure_state_tables(conn)
+            row = conn.execute(
+                """
+                SELECT source_record_id
+                  FROM pipeline_watermark
+                 WHERE source_table = ?
+                """,
+                [source_table],
+            ).fetchone()
+            if row is None or row[0] is None:
+                return None
+            value = str(row[0]).strip()
+            return value or None
+        finally:
+            conn.close()
+
     def save_watermark(self, source_table: str, source_updated_at: datetime) -> None:
         conn = self._connect()
         try:
@@ -722,6 +859,17 @@ class DedupeDuckDBStore:
                 conn,
                 source_table=source_table,
                 candidate=source_updated_at,
+            )
+        finally:
+            conn.close()
+
+    def save_record_id_watermark(self, source_table: str, source_record_id: str) -> None:
+        conn = self._connect()
+        try:
+            self._set_record_id_watermark_if_greater_tx(
+                conn,
+                source_table=source_table,
+                candidate=source_record_id,
             )
         finally:
             conn.close()
@@ -744,6 +892,7 @@ class DedupeDuckDBStore:
         completed: bool,
         rows_processed_total: int,
         watermark_candidate: datetime | None,
+        watermark_record_id_candidate: str | None = None,
     ) -> None:
         conn = self._connect()
         try:
@@ -769,6 +918,12 @@ class DedupeDuckDBStore:
                         source_table=source_table,
                         candidate=watermark_candidate,
                     )
+                if watermark_record_id_candidate is not None:
+                    self._set_record_id_watermark_if_greater_tx(
+                        conn,
+                        source_table=source_table,
+                        candidate=watermark_record_id_candidate,
+                    )
                 self._complete_run_tx(
                     conn,
                     run_id=run_id,
@@ -785,6 +940,28 @@ class DedupeDuckDBStore:
                 raise
         finally:
             conn.close()
+
+
+def _parse_nomor_induk_parts(value: Any) -> dict[str, str] | None:
+    if value is None:
+        return None
+    token = str(value).strip()
+    if not NOMOR_INDUK_PATTERN.fullmatch(token):
+        return None
+    month = token[7:9]
+    day = token[9:11]
+    if not ("01" <= month <= "12"):
+        return None
+    if not ("01" <= day <= "31"):
+        return None
+    return {
+        "nomor_induk": token,
+        "id_upt": token[0:3],
+        "year": token[3:7],
+        "month": month,
+        "day": day,
+        "sequence": token[11:15],
+    }
 
 
 def _as_datetime(value: Any) -> datetime | None:

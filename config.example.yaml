@@ -9,29 +9,23 @@ source_mysql:
   # Optional: override table scan with a custom SELECT query.
   # Requirements:
   # - Query must expose all mapped columns in `columns.*`
-  # - Query must expose `source_id_column` and `source_updated_at_column`
+  # - Query must expose `source_id_column`
+  # - Query should expose `source_updated_at_column` when using updated_at cursor mode
   # - Do not include LIMIT; batching is controlled by pipeline options
   custom_query: null
   # custom_query: |
   #   SELECT it.*
   #   FROM identitas it
-  #   WHERE it.NAMA_LENGKAP <> ''
+  #   LEFT JOIN cif_mapping cm ON it.NOMOR_INDUK = cm.NOMOR_INDUK
+  #   LEFT JOIN perkara p ON p.NOMOR_INDUK = it.NOMOR_INDUK
+  #   WHERE cm.NOMOR_INDUK IS NULL
+  #     AND p.ID_PERKARA IS NOT NULL
+  #     AND it.NAMA_LENGKAP <> ''
   #     AND it.NAMA_LENGKAP NOT LIKE 'NAMA WBP%'
   #     AND it.NOMOR_INDUK NOT LIKE '11f066%'
-  #     AND EXISTS (
-  #       SELECT 1
-  #       FROM perkara p
-  #       WHERE p.NOMOR_INDUK = it.NOMOR_INDUK
-  #         AND p.ID_PERKARA IS NOT NULL
-  #         AND p.ID_UPT IS NOT NULL
-  #     )
-  #     AND NOT EXISTS (
-  #       SELECT 1
-  #       FROM cif_mapping cm
-  #       WHERE cm.NOMOR_INDUK = it.NOMOR_INDUK
-  #     )
+  #     AND p.ID_UPT IS NOT NULL
   source_id_column: "nomor_induk"
-  # Required for incremental runs; can be null for full-only runs.
+  # Optional. If null, incremental/bootstrap use source_id cursor mode (ordered by source_id_column).
   source_updated_at_column: "updated_at"
 
 dedupe_duckdb:
