@@ -248,6 +248,20 @@ GROUP BY entity_id
 HAVING MAX(member_count) > 1
 ORDER BY member_count DESC, entity_id
 LIMIT 50;
+
+-- show all entities with their members (entity CIF repeated per member row)
+SELECT
+  entity_id,
+  cif_number,
+  member_record_id,
+  is_canonical_member,
+  member_count,
+  decision,
+  best_match_probability
+FROM entity_audit_view
+WHERE member_record_id IS NOT NULL
+ORDER BY entity_id, is_canonical_member DESC, member_record_id
+LIMIT 500;
 ```
 
 ```sql
