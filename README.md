@@ -145,9 +145,64 @@ Bootstrap mode behavior:
 - When bootstrap finishes, the normal watermark is advanced and only new records are processed.
 - Bootstrap is done when a run returns `records_processed: 0` (or `< batch size` on the final non-zero run).
 
+## Bootstrap By UPT (Automated)
+
+Use the template + orchestrator to avoid manually editing 600 configs.
+
+Files:
+- `/Users/hap/Documents/dev/sdp/dedupe/config.upt.template.yaml`
+- `/Users/hap/Documents/dev/sdp/dedupe/scripts/bootstrap_by_upt.py`
+
+Template placeholders:
+- `__UPT__` for current UPT (example `003`)
+- `__UPT_NEXT__` for upper-bound range (example `004`)
+
+What gets auto-isolated per UPT:
+- `source_mysql.source_table` (state key in DuckDB)
+- `custom_query` range by `NOMOR_INDUK`
+- `run.watermark_file`
+- `run.bootstrap_state_file`
+
+Run UPT 001..600:
+
+```bash
+uv run python scripts/bootstrap_by_upt.py \
+  --template-config config.upt.template.yaml \
+  --upt-start 1 \
+  --upt-end 600 \
+  --max-rows 200000
+```
+
+Run by explicit list file:
+
+```bash
+# file format: one code per line, comments allowed
+cat > /tmp/upt_list.txt <<'EOF'
+001
+003
+073
+600
+EOF
+
+uv run python scripts/bootstrap_by_upt.py \
+  --template-config config.upt.template.yaml \
+  --upt-list /tmp/upt_list.txt \
+  --max-rows 200000
+```
+
+Notes:
+- Keep one shared `dedupe_duckdb.path` so cross-UPT linking still works.
+- Script loops bootstrap per UPT until `records_processed` becomes `0`.
+- Rendered configs are written to `./work/upt_configs`.
+- Script applies `sql/duckdb_schema.sql` automatically (use `--skip-init-schema` to disable).
+
 ## Dummy Source With Docker Compose
 
-Use this to spin up a local MariaDB source and seed high-volume synthetic inmate data.
+Use this to spin up a local MariaDB source and seed production-like synthetic data:
+- `identitas` (uppercase source columns)
+- `perkara`
+- `cif_mapping`
+- `NOMOR_INDUK` in `XXXYYYYMMDDNNNN` format for source-id cursor testing
 
 Start source DB:
 
@@ -169,15 +224,15 @@ Adminer login for dummy source:
 - Server: `source-db`
 - Username: `readonly_source_user` (or `root`)
 - Password: `source_pass` (or `rootpass` for root)
-- Database: `corrections_prod`
+- Database: `sdp_pusat`
 
-Seed data (default: 500,000 rows):
+Seed data (default: 10,000 rows):
 
 ```bash
 docker compose run --rm source-seed
 ```
 
-Seed a different volume (up to 1,000,000 with current generator):
+Seed a different volume (generator supports up to 1,000,000 with current sequence):
 
 ```bash
 docker compose run --rm -e SEED_ROWS=1000000 source-seed
@@ -197,6 +252,11 @@ uv run inmate-dedupe --config config.dummy.yaml bootstrap
 # repeat bootstrap until records_processed becomes 0
 uv run inmate-dedupe --config config.dummy.yaml incremental
 ```
+
+`config.dummy.yaml` is prewired to custom query mode with joins:
+- `identitas` + `perkara` + `cif_mapping`
+- `source_id_column: NOMOR_INDUK`
+- `source_updated_at_column: null` (source-id cursor mode)
 
 Stop local source:
 

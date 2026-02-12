@@ -102,7 +102,10 @@ def _settings_dict(
                 },
                 {"sql_condition": "nama_lengkap_l = nama_lengkap_r", "label_for_charts": "Exact"},
                 {"sql_condition": "nama_lengkap_soundex_l = nama_lengkap_soundex_r", "label_for_charts": "Phonetic"},
-                {"sql_condition": "levenshtein(nama_lengkap_l, nama_lengkap_r) <= 2", "label_for_charts": "Levenshtein <= 2"},
+                {
+                    "sql_condition": "levenshtein(CAST(nama_lengkap_l AS VARCHAR), CAST(nama_lengkap_r AS VARCHAR)) <= 2",
+                    "label_for_charts": "Levenshtein <= 2",
+                },
                 {"sql_condition": "ELSE", "label_for_charts": "No match"},
             ],
         },
@@ -115,7 +118,10 @@ def _settings_dict(
                     "label_for_charts": "Null",
                 },
                 {"sql_condition": "alias_names_l = alias_names_r", "label_for_charts": "Exact"},
-                {"sql_condition": "levenshtein(alias_names_l, alias_names_r) <= 3", "label_for_charts": "Levenshtein <= 3"},
+                {
+                    "sql_condition": "levenshtein(CAST(alias_names_l AS VARCHAR), CAST(alias_names_r AS VARCHAR)) <= 3",
+                    "label_for_charts": "Levenshtein <= 3",
+                },
                 {"sql_condition": "ELSE", "label_for_charts": "No match"},
             ],
         },
@@ -169,7 +175,7 @@ def _settings_dict(
                 },
                 {"sql_condition": "alamat_combined_l = alamat_combined_r", "label_for_charts": "Exact"},
                 {
-                    "sql_condition": "levenshtein(alamat_combined_l, alamat_combined_r) <= 5",
+                    "sql_condition": "levenshtein(CAST(alamat_combined_l AS VARCHAR), CAST(alamat_combined_r AS VARCHAR)) <= 5",
                     "label_for_charts": "Levenshtein <= 5",
                 },
                 {"sql_condition": "ELSE", "label_for_charts": "No match"},
@@ -180,7 +186,10 @@ def _settings_dict(
             "comparison_levels": [
                 {"sql_condition": "nm_ayah_l IS NULL OR nm_ayah_r IS NULL", "is_null_level": True, "label_for_charts": "Null"},
                 {"sql_condition": "nm_ayah_l = nm_ayah_r", "label_for_charts": "Exact"},
-                {"sql_condition": "levenshtein(nm_ayah_l, nm_ayah_r) <= 2", "label_for_charts": "Levenshtein <= 2"},
+                {
+                    "sql_condition": "levenshtein(CAST(nm_ayah_l AS VARCHAR), CAST(nm_ayah_r AS VARCHAR)) <= 2",
+                    "label_for_charts": "Levenshtein <= 2",
+                },
                 {"sql_condition": "ELSE", "label_for_charts": "No match"},
             ],
         },
@@ -189,7 +198,10 @@ def _settings_dict(
             "comparison_levels": [
                 {"sql_condition": "nm_ibu_l IS NULL OR nm_ibu_r IS NULL", "is_null_level": True, "label_for_charts": "Null"},
                 {"sql_condition": "nm_ibu_l = nm_ibu_r", "label_for_charts": "Exact"},
-                {"sql_condition": "levenshtein(nm_ibu_l, nm_ibu_r) <= 2", "label_for_charts": "Levenshtein <= 2"},
+                {
+                    "sql_condition": "levenshtein(CAST(nm_ibu_l AS VARCHAR), CAST(nm_ibu_r AS VARCHAR)) <= 2",
+                    "label_for_charts": "Levenshtein <= 2",
+                },
                 {"sql_condition": "ELSE", "label_for_charts": "No match"},
             ],
         },

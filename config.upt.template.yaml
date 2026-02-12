@@ -1,0 +1,151 @@
+source_mysql:
+  host: "127.0.0.1"
+  port: 3309
+  user: "readonly_source_user"
+  password: "source_pass"
+  database: "sdp_pusat"
+  # This becomes the logical state key in DuckDB for watermark/bootstrap state.
+  source_table: "identitas___UPT__"
+  custom_query: |
+    SELECT
+      it.*,
+      p.ID_UPT AS ID_UPT
+    FROM identitas it
+    LEFT JOIN cif_mapping cm ON it.NOMOR_INDUK = cm.NOMOR_INDUK
+    LEFT JOIN perkara p ON p.NOMOR_INDUK = it.NOMOR_INDUK
+    WHERE cm.NOMOR_INDUK IS NULL
+      AND p.ID_PERKARA IS NOT NULL
+      AND p.ID_UPT IS NOT NULL
+      AND it.NAMA_LENGKAP <> ''
+      AND it.NAMA_LENGKAP NOT LIKE 'NAMA WBP%'
+      AND it.NOMOR_INDUK NOT LIKE '11f066%'
+      AND it.NOMOR_INDUK >= '__UPT__000000000000'
+      AND it.NOMOR_INDUK <  '__UPT_NEXT__000000000000'
+  source_id_column: "NOMOR_INDUK"
+  source_updated_at_column: null
+
+dedupe_duckdb:
+  # Keep one shared DuckDB so cross-UPT linking still works.
+  path: "./work/dedupe.duckdb"
+
+columns:
+  id_upt: "ID_UPT"
+  nik: "NIK"
+  nomor_induk_nasional: "NOMOR_INDUK_NASIONAL"
+  nama_lengkap: "NAMA_LENGKAP"
+  nama_alias1: "NAMA_ALIAS1"
+  nama_alias2: "NAMA_ALIAS2"
+  nama_alias3: "NAMA_ALIAS3"
+  nama_kecil1: "NAMA_KECIL1"
+  nama_kecil2: "NAMA_KECIL2"
+  nama_kecil3: "NAMA_KECIL3"
+  tanggal_lahir: "TANGGAL_LAHIR"
+  id_jenis_kelamin: "ID_JENIS_KELAMIN"
+  alamat: "ALAMAT"
+  alamat_alternatif: "ALAMAT_ALTERNATIF"
+  kodepos: "KODEPOS"
+  telepon: "TELEPON"
+  telephone_keluarga: "TELEPHONE_KELUARGA"
+  nm_ayah: "NM_AYAH"
+  nm_ibu: "NM_IBU"
+  nm_istri_suami: "NM_ISTRI_SUAMI"
+  passthrough:
+    - "ID_TEMPAT_LAHIR"
+    - "ID_TEMPAT_LAHIR_LAIN"
+    - "ID_JENIS_AGAMA"
+    - "ID_JENIS_AGAMA_LAIN"
+    - "ID_JENIS_SUKU"
+    - "ID_JENIS_SUKU_LAIN"
+    - "ID_JENIS_PENDIDIKAN"
+    - "ID_JENIS_PENDIDIKAN_LAIN"
+    - "ID_JENIS_PEKERJAAN"
+    - "ID_JENIS_PEKERJAAN_LAIN"
+    - "KETERANGAN_PEKERJAAN"
+    - "ALAMAT_PEKERJAAN"
+    - "MINAT"
+    - "ID_JENIS_WARGANEGARA"
+    - "ID_NEGARA_ASING"
+    - "ID_JENIS_STATUS_PERKAWINAN"
+    - "TMP_TGL_AYAH"
+    - "TMP_TGL_IBU"
+    - "NM_SAUDARA"
+    - "ANAKKE"
+    - "JML_SAUDARA"
+    - "JML_ISTRI_SUAMI"
+    - "TMP_TGL_ISTRI_SUAMI"
+    - "JML_ANAK"
+    - "NM_ANAK"
+    - "TINGGI"
+    - "BERAT"
+    - "CACAT"
+    - "CIRI"
+    - "CIRI2"
+    - "CIRI3"
+    - "ID_JENIS_RAMBUT"
+    - "ID_BENTUKRAMBUT"
+    - "ID_JENIS_MUKA"
+    - "ID_BENTUK_MATA"
+    - "ID_WARNA_MATA"
+    - "ID_KACAMATA"
+    - "ID_JENIS_HIDUNG"
+    - "ID_TELINGA"
+    - "ID_JENIS_MULUT"
+    - "ID_BENTUKBIBIR"
+    - "ID_WARNAKULIT"
+    - "ID_JENIS_TANGAN"
+    - "ID_LENGAN"
+    - "ID_JENIS_KAKI"
+    - "FOTO_DEPAN"
+    - "FOTO_KANAN"
+    - "FOTO_KIRI"
+    - "FOTO_CLOSEUP"
+    - "FOTO_CIRI_1"
+    - "FOTO_CIRI_2"
+    - "FOTO_CIRI_3"
+    - "IS_WBP_BERESIKO_TINGGI"
+    - "IS_PENGARUH_TERHADAP_MASYARAKAT"
+    - "IS_BACA_LATIN"
+    - "IS_BACA_QURAN"
+    - "IS_DISABILITAS"
+    - "IS_VERIFIKASI"
+    - "RESIDIVIS"
+    - "RESIDIVIS_COUNTER"
+    - "ID_JENIS_KEAHLIAN_1"
+    - "ID_JENIS_KEAHLIAN_1_LAIN"
+    - "ID_JENIS_KEAHLIAN_2"
+    - "ID_JENIS_KEAHLIAN_2_LAIN"
+    - "ID_USER"
+    - "CREATED_BY"
+    - "UPDATED_BY"
+
+run:
+  model_version: "v1-idn"
+  batch_size: 100000
+  work_dir: "./work"
+  watermark_file: "./work/watermark___UPT__.json"
+  bootstrap_state_file: "./work/bootstrap_state___UPT__.json"
+  bootstrap_batch_rows: 200000
+  review_candidate_limit: 250000
+  max_training_pairs: 5000000
+
+thresholds:
+  auto_match_probability: 0.93
+  review_match_probability: 0.82
+
+blocking_rules:
+  full:
+    - "l.nik = r.nik"
+    - "l.nomor_induk_nasional = r.nomor_induk_nasional"
+    - "l.tanggal_lahir = r.tanggal_lahir and l.nama_prefix = r.nama_prefix"
+    - "l.dob_year = r.dob_year and l.nama_lengkap_soundex = r.nama_lengkap_soundex and l.id_jenis_kelamin = r.id_jenis_kelamin"
+    - "l.telepon_any = r.telepon_any and l.nama_prefix = r.nama_prefix"
+  incremental:
+    - "l.nik = r.nik"
+    - "l.nomor_induk_nasional = r.nomor_induk_nasional"
+    - "l.tanggal_lahir = r.tanggal_lahir and l.nama_prefix = r.nama_prefix"
+    - "l.telepon_any = r.telepon_any and l.nama_prefix = r.nama_prefix"
+
+deterministic_rules:
+  - "l.nik = r.nik and l.nik IS NOT NULL"
+  - "l.nomor_induk_nasional = r.nomor_induk_nasional and l.nomor_induk_nasional IS NOT NULL"
+  - "l.nama_lengkap = r.nama_lengkap and l.tanggal_lahir = r.tanggal_lahir and l.id_jenis_kelamin = r.id_jenis_kelamin"

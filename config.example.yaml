@@ -3,7 +3,7 @@ source_mysql:
   port: 3306
   user: "readonly_source_user"
   password: "replace-source-password"
-  database: "corrections_prod"
+  database: "sdp_pusat"
   # Logical source name used for run/state metadata keys.
   source_table: "inmate_records_stage"
   # Optional: override table scan with a custom SELECT query.
